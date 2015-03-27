@@ -1,6 +1,7 @@
 import sys, time
 import py, pytest
 
+from _pytest.runner import call_and_report
 from _pytest.runner import runtestprotocol
 
 # command line options
@@ -12,7 +13,7 @@ def pytest_addoption(parser):
         type="int",
         default=0,
         help="number of times to re-run failed tests. defaults to 0.")
-        
+
 
 def pytest_configure(config):
     #Add flaky marker
@@ -53,12 +54,22 @@ def pytest_runtest_protocol(item, nextitem):
 
     #Use the marker as a priority over the global setting.
     if rerun_marker is not None:
+        fixture_once = False
+        pause = 0
         if "reruns" in rerun_marker.kwargs:
             #Check for keyword arguments
             reruns = rerun_marker.kwargs["reruns"]
+            if "fixture_once" in rerun_marker.kwargs:
+                fixture_once = bool(rerun_marker.kwargs["fixture_once"])
+            if "pause" in rerun_marker.kwargs:
+                pause = rerun_marker.kwargs["pause"]
         elif len(rerun_marker.args) > 0:
             #Check for arguments
             reruns = rerun_marker.args[0]
+            if len(rerun_marker.args) > 1:
+                fixture_once = bool(rerun_marker.args[1])
+            if len(rerun_marker.args) > 2:
+                pause = rerun_marker.args[2]
     elif item.session.config.option.reruns is not None:
         #Default to the global setting
         reruns = item.session.config.option.reruns
@@ -74,16 +85,11 @@ def pytest_runtest_protocol(item, nextitem):
         nodeid=item.nodeid, location=item.location,
     )
 
-    for i in range(reruns+1):  # ensure at least one run of each item
-        reports = runtestprotocol(item, nextitem=nextitem, log=False)
-        # break if setup and call pass
-        if reports[0].passed and reports[1].passed:
-            break
-
-        # break if test marked xfail
-        evalxfail = getattr(item, '_evalxfail', None)
-        if evalxfail:
-            break
+    if fixture_once:
+        reports, i = repeat_test_only(
+            item, nextitem, reruns=reruns, pause=pause, log=False)
+    else:
+        reports, i = repeat_run(item, nextitem, reruns=reruns, log=False)
 
     for report in reports:
         if report.when in ("call"):
@@ -94,6 +100,63 @@ def pytest_runtest_protocol(item, nextitem):
     # pytest_runtest_protocol returns True
     return True
 
+
+def repeat_run(item, nextitem, reruns=0, log=False):
+    """
+    Repeat setup, test and teardown
+    """
+    for i in range(reruns+1):  # ensure at least one run of each item
+        reports = runtestprotocol(item, nextitem=nextitem, log=log)
+        # break if setup and call pass
+        if reports[0].passed and reports[1].passed:
+            break
+
+        # break if test marked xfail
+        evalxfail = getattr(item, '_evalxfail', None)
+        if evalxfail:
+            break
+
+    return reports, i
+
+def repeat_test_only(item, nextitem, reruns=0, pause=0, log=False):
+    """
+    Only repeat the test, just one setup and teardown. Wait for
+    pause milliseconds between each run.
+    """
+    hasrequest = hasattr(item, "_request")
+    if hasrequest and not item._request:
+        item._initrequest()
+    reports = []
+    reports.append(call_and_report(item, "setup", log=log))
+    if reports[0].passed:
+        for i in range(reruns+1):  # ensure at least one run of each item
+            rep = call_and_report(item, "call", log=log)
+
+            # break if setup and call pass
+            if rep.passed:
+                reports.append(rep)
+                break
+
+            # break if test marked xfail
+            evalxfail = getattr(item, '_evalxfail', None)
+            if evalxfail:
+                reports.append(rep)
+                break
+
+            # pause if necessary
+            if pause > 0:
+                time.sleep(pause/1000.0)
+
+    if len(reports) == 1:
+        reports.append(rep)
+    reports.append(call_and_report(item, "teardown", log=log,
+        nextitem=nextitem))
+    # after all teardown hooks have been called
+    # want funcargs and request info to go away
+    if hasrequest:
+        item._request = False
+        item.funcargs = None
+    return reports, i
 
 def pytest_report_teststatus(report):
     """ adapted from
